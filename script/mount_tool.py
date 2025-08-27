@@ -1,555 +1,747 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mount_tool_final.py
+Final improved storage browser:
+- Interactive UI as normal user, elevate individual commands with sudo
+- Wayland/X11/Hyprland/kitty/fish-friendly GUI launching
+- Headless fallbacks and --no-gui option
+- SAFE mode to block mutating operations
+- Robust lsblk parsing and basic LUKS mapper detection
+- Logging
+"""
 
+from __future__ import annotations
 import os
 import sys
+import json
 import subprocess
-import readline
+import termios
+import tty
 import signal
+import shutil
+import time
+import re
+import argparse
+import logging
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, Callable
 
-# Terminal colors
-COLORS = {
-    "header": "\033[95m", "info": "\033[94m", "success": "\033[92m",
-    "error": "\033[91m", "prompt": "\033[93m", "mounted": "\033[96m",
-    "bold": "\033[1m", "end": "\033[0m", "swap": "\033[33m"
+# --------------------
+# Config / Constants
+# --------------------
+DEFAULT_MOUNT_BASE = os.environ.get("MOUNT_BASE", "/mnt")
+VMKEYS_DIR = Path(os.environ.get("VMKEYS_DIR", "/etc/vmkeys"))
+LOG_PATH = Path(os.environ.get("MOUNT_TOOL_LOG", Path.home() / ".cache" / "mount_tool.log"))
+
+_USE_COLORS = sys.stdout.isatty()
+COL = {
+    "reset": "\033[0m" if _USE_COLORS else "",
+    "bold": "\033[1m" if _USE_COLORS else "",
+    "underline": "\033[4m" if _USE_COLORS else "",
+    "rev": "\033[7m" if _USE_COLORS else "",
+    "green": "\033[32m" if _USE_COLORS else "",
+    "yellow": "\033[33m" if _USE_COLORS else "",
+    "red": "\033[31m" if _USE_COLORS else "",
+    "cyan": "\033[36m" if _USE_COLORS else "",
+    "magenta": "\033[35m" if _USE_COLORS else "",
+    "blue": "\033[34m" if _USE_COLORS else "",
 }
 
-# Global for tab completion
-completion_list = []
-
-def print_banner():
-    banner = r"""
+BANNER = r"""
 ███╗   ███╗ ██████╗ ██╗   ██╗███╗   ██╗████████╗
 ████╗ ████║██╔═══██╗██║   ██║████╗  ██║╚══██╔══╝
-██╔████╔██║██║   ██║██║   ██║██╔██╗ ██║   ██║   
-██║╚██╔╝██║██║   ██║██║   ██║██║╚██╗██║   ██║   
-██║ ╚═╝ ██║╚██████╔╝╚██████╔╝██║ ╚████║   ██║   
-╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝   ╚═╝ 
+██╔████╔██║██║   ██║██║   ██║██╔██╗ ██║   ██║
+██║╚██╔╝██║██║   ██║██║   ██║██║╚██╗██║   ██║
+██║ ╚═╝ ██║╚██████╔╝╚██████╔╝██║ ╚████║   ██║
+╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝   ╚═╝
 """
-    print(COLORS["header"] + banner + COLORS["end"])
 
-def init_tab_completion():
-    def complete(text, state):
-        matches = [x for x in completion_list if x.startswith(text)]
-        return matches[state] if state < len(matches) else None
-    readline.parse_and_bind("tab: complete")
-    readline.set_completer(complete)
-    readline.set_completer_delims(' \t\n')
+# --------------------
+# Logging
+# --------------------
+try:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=str(LOG_PATH), level=logging.DEBUG,
+                        format="%(asctime)s %(levelname)s %(message)s")
+except Exception:
+    logging.basicConfig(level=logging.DEBUG)
 
-def require_root():
-    if os.geteuid() != 0:
-        print(f"{COLORS['error']}Please run as root/sudo{COLORS['end']}")
-        sys.exit(1)
+# --------------------
+# Global runtime flags (set in main)
+# --------------------
+SAFE_MODE = False
+NO_GUI = False
 
-def get_block_devices():
+# --------------------
+# Utilities
+# --------------------
+def run_cmd(cmd: List[str], check=True, capture=True, text=True, env=None) -> subprocess.CompletedProcess:
+    """Run a command and return CompletedProcess. Logs errors."""
+    logging.debug("run_cmd: %s", " ".join(cmd))
     try:
-        result = subprocess.run(
-            ["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID", "-nP"],
-            stdout=subprocess.PIPE, check=True, text=True
-        )
+        return subprocess.run(cmd, check=check, capture_output=capture, text=text, env=env)
     except subprocess.CalledProcessError as e:
-        print(f"{COLORS['error']}lsblk failed: {e}{COLORS['end']}")
-        sys.exit(1)
+        logging.warning("Command failed: %s rc=%s stderr=%s", cmd, e.returncode, e.stderr)
+        raise
 
-    devices = []
-    for line in result.stdout.strip().split('\n'):
-        if not line: continue
-        
-        device_info = {}
-        for field in line.split():
-            if '=' in field:
-                key, value = field.split('=', 1)
-                device_info[key] = value.strip('"')
-        
-        name = device_info.get("NAME", "")
-        size = device_info.get("SIZE", "")
-        dev_type = device_info.get("TYPE", "")
-        fstype = device_info.get("FSTYPE", "")
-        mountpoint = device_info.get("MOUNTPOINT", "")
-        label = device_info.get("LABEL", "")
-        uuid = device_info.get("UUID", "")
-        
-        if dev_type != "part": continue
-        
-        # Handle special filesystems
-        is_swap = fstype == "swap"
-        is_luks = fstype == "crypto_LUKS"
-        mapper_name = ""
-        
-        if is_luks:
-            try:
-                mapper_result = subprocess.run(
-                    ["cryptsetup", "status", name],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-                )
-                if mapper_result.returncode == 0:
-                    for status_line in mapper_result.stdout.split('\n'):
-                        if status_line.startswith("  device:"):
-                            mapper_name = status_line.split()[-1].split('/')[-1]
-            except Exception:
-                pass
-                
-        devices.append({
-            "name": name, "size": size, "type": dev_type, "fstype": fstype,
-            "mountpoint": mountpoint, "label": label, "uuid": uuid,
-            "is_luks": is_luks, "mapper_name": mapper_name, 
-            "unlocked": bool(mapper_name), "is_swap": is_swap
-        })
-        
-    return devices
+def run_priv(cmd: List[str], check=True, capture=True, text=True, sudo_prompt=True) -> subprocess.CompletedProcess:
+    """
+    Run a privileged command via sudo if not root.
+    If already root, runs directly.
+    """
+    if os.geteuid() == 0:
+        return run_cmd(cmd, check=check, capture=capture, text=text)
+    sudo_cmd = ["sudo"]
+    # preserve environment variables that matter for cryptsetup/fsck etc.
+    sudo_cmd.extend(cmd)
+    return run_cmd(sudo_cmd, check=check, capture=capture, text=text)
 
-def list_devices(devices):
-    print(f"{COLORS['info']}\nAvailable block devices:{COLORS['end']}")
-    header = (f"{COLORS['bold']} {'No.':>3}  {'Device':<16} {'Size':>8} {'Type':<8} "
-              f"{'Status':<10} {'Label/UUID':<36}  {'Mountpoint':<20}{COLORS['end']}")
-    print(header)
-    
-    for i, dev in enumerate(devices, start=1):
-        if dev["is_luks"]:
-            if dev["unlocked"]:
-                disp_name = f"/dev/mapper/{dev['mapper_name']}"
-                status = "UNLOCKED"
-            else:
-                disp_name = f"/dev/{dev['name']}"
-                status = "LOCKED"
-        else:
-            disp_name = f"/dev/{dev['name']}"
-            status = "NORMAL"
-        
-        # Special formatting for swap and mounted devices
-        if dev["is_swap"]:
-            mount_str = f"{COLORS['swap']}[SWAP]{COLORS['end']}"
-            id_str = f"{COLORS['swap']}{dev['uuid']}{COLORS['end']}"
-        else:
-            mount_str = (f"{COLORS['mounted']}{dev['mountpoint']}{COLORS['end']}" 
-                        if dev["mountpoint"] else "-")
-            id_str = dev["label"] if dev["label"] else dev["uuid"]
-        
-        print(f" {COLORS['bold']}{i:>3}{COLORS['end']}  {COLORS['prompt']}{disp_name:<16}{COLORS['end']} "
-              f"{dev['size']:>8} {dev['type']:<8} {status:<10} {id_str:<36}  {mount_str:<20}")
+def ok() -> str:
+    return f"{COL['green']}OK{COL['reset']}"
 
-def get_device_choice(devices):
-    while True:
-        try:
-            choice = input(f"\n{COLORS['prompt']}Choose disk (q to quit): {COLORS['end']}").strip().lower()
-            if choice == 'q': sys.exit(0)
-            if choice.isdigit():
-                idx = int(choice) - 1
-                if 0 <= idx < len(devices):
-                    dev = devices[idx]
-                    print(f"\n{COLORS['info']}Selected device:{COLORS['end']}")
-                    print(f"  Device:    {COLORS['bold']}/dev/{dev['name']}{COLORS['end']}")
-                    if dev['is_luks'] and dev['unlocked']:
-                        print(f"  Mapper:    {COLORS['bold']}/dev/mapper/{dev['mapper_name']}{COLORS['end']}")
-                    print(f"  Size:      {dev['size']}")
-                    print(f"  Type:      {dev['type']}")
-                    print(f"  Filesystem:{dev['fstype']}")
-                    print(f"  Label:     {dev['label'] if dev['label'] else '-'}")
-                    print(f"  UUID:      {dev['uuid']}")
-                    print(f"  Mounted at:{dev['mountpoint'] if dev['mountpoint'] else '-'}")
-                    if dev['is_swap']:
-                        print(f"  {COLORS['swap']}SWAP device detected{COLORS['end']}")
-                    return dev
-            print(f"{COLORS['error']}Invalid selection{COLORS['end']}")
-        except KeyboardInterrupt:
-            print(f"\n{COLORS['info']}Operation cancelled{COLORS['end']}")
-            sys.exit(0)
+def err() -> str:
+    return f"{COL['red']}ERR{COL['reset']}"
 
-def kill_processes_using_device(device):
-    """Find and kill processes using the device"""
-    if device["is_luks"] and device["unlocked"]:
-        dev_path = f"/dev/mapper/{device['mapper_name']}"
-    else:
-        dev_path = f"/dev/{device['name']}"
-    
+def clear_screen():
+    if sys.stdout.isatty():
+        os.system("clear")
+
+def safe_input(prompt=""):
     try:
-        # Find processes using the device
-        lsof = subprocess.run(
-            ["lsof", "-t", dev_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        
-        if lsof.returncode == 0 and lsof.stdout.strip():
-            pids = lsof.stdout.strip().split()
-            print(f"{COLORS['info']}Processes using {dev_path}: {', '.join(pids)}{COLORS['end']}")
-            
-            confirm = input(f"{COLORS['prompt']}Kill these processes? (y/N): {COLORS['end']}").strip().lower()
-            if confirm == 'y':
-                for pid in pids:
-                    try:
-                        os.kill(int(pid), signal.SIGTERM)
-                        print(f"{COLORS['info']}Sent TERM to PID {pid}{COLORS['end']}")
-                    except ProcessLookupError:
-                        print(f"{COLORS['error']}Process {pid} not found{COLORS['end']}")
-                    except Exception as e:
-                        print(f"{COLORS['error']}Failed to kill {pid}: {e}{COLORS['end']}")
-                return True
-            return False
-        return True
-    except Exception as e:
-        print(f"{COLORS['error']}Error checking processes: {e}{COLORS['end']}")
+        return input(prompt)
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+def confirm(prompt: str, default_no=True) -> bool:
+    suffix = " [y/N]: " if default_no else " [Y/n]: "
+    ans = safe_input(COL["yellow"] + prompt + suffix + COL["reset"])
+    if ans is None:
         return False
+    ans = ans.strip().lower()
+    if not ans:
+        return not default_no
+    return ans in ("y", "yes")
 
-def handle_swap(device, action):
-    """Handle swap operations"""
-    dev_path = f"/dev/{device['name']}"
-    if action == "on":
-        try:
-            subprocess.run(["swapon", dev_path], check=True)
-            print(f"{COLORS['success']}Enabled swap {dev_path}{COLORS['end']}")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"{COLORS['error']}Failed to enable swap: {e}{COLORS['end']}")
-            return False
-    elif action == "off":
-        try:
-            subprocess.run(["swapoff", dev_path], check=True)
-            print(f"{COLORS['success']}Disabled swap {dev_path}{COLORS['end']}")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"{COLORS['error']}Failed to disable swap: {e}{COLORS['end']}")
-            if not kill_processes_using_device(device):
-                print(f"{COLORS['error']}Could not free swap device{COLORS['end']}")
-                return False
-            try:
-                subprocess.run(["swapoff", dev_path], check=True)
-                print(f"{COLORS['success']}Disabled swap after killing processes{COLORS['end']}")
-                return True
-            except subprocess.CalledProcessError as e:
-                print(f"{COLORS['error']}Still can't disable swap: {e}{COLORS['end']}")
-                return False
-    return False
-
-def handle_normal_device(device):
-    """Handle actions for normal (non-LUKS, non-swap) devices"""
-    if device["mountpoint"]:
-        try:
-            action = input(
-                f"{COLORS['prompt']}Device is mounted at {device['mountpoint']}. "
-                f"(u)nmount, (r)emount, (f)ilesystem check, or (c)ancel? [u/r/f/c]: {COLORS['end']}"
-            ).strip().lower()
-            
-            if action == 'u':
-                if device["is_luks"] and device["unlocked"]:
-                    dev_path = f"/dev/mapper/{device['mapper_name']}"
-                else:
-                    dev_path = f"/dev/{device['name']}"
-                
-                try:
-                    subprocess.run(["umount", dev_path], check=True)
-                    print(f"{COLORS['success']}Unmounted {dev_path}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to unmount: {e}{COLORS['end']}")
-                    if kill_processes_using_device(device):
-                        try:
-                            subprocess.run(["umount", dev_path], check=True)
-                            print(f"{COLORS['success']}Unmounted after killing processes{COLORS['end']}")
-                            return True
-                        except subprocess.CalledProcessError as e:
-                            print(f"{COLORS['error']}Still can't unmount: {e}{COLORS['end']}")
-                            return False
-                    return False
-            
-            elif action == 'r':
-                mount_point = device["mountpoint"]
-                if device["is_luks"] and device["unlocked"]:
-                    dev_path = f"/dev/mapper/{device['mapper_name']}"
-                else:
-                    dev_path = f"/dev/{device['name']}"
-                
-                try:
-                    subprocess.run(["umount", dev_path], check=True)
-                    subprocess.run(["mount", dev_path, mount_point], check=True)
-                    print(f"{COLORS['success']}Remounted {dev_path} at {mount_point}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to remount: {e}{COLORS['end']}")
-                    return False
-            
-            elif action == 'f':
-                if device["is_luks"] and device["unlocked"]:
-                    dev_path = f"/dev/mapper/{device['mapper_name']}"
-                else:
-                    dev_path = f"/dev/{device['name']}"
-                
-                try:
-                    print(f"{COLORS['info']}Running filesystem check on {dev_path}{COLORS['end']}")
-                    subprocess.run(["umount", dev_path], check=True)
-                    subprocess.run(["fsck", "-y", dev_path], check=True)
-                    subprocess.run(["mount", dev_path, device["mountpoint"]], check=True)
-                    print(f"{COLORS['success']}Filesystem check completed{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Filesystem check failed: {e}{COLORS['end']}")
-                    return False
-            
-            return False
-        except KeyboardInterrupt:
-            print(f"\n{COLORS['info']}Operation cancelled{COLORS['end']}")
-            sys.exit(0)
-    else:
-        try:
-            action = input(
-                f"{COLORS['prompt']}Device not mounted. "
-                f"(m)ount, (f)ilesystem check, or (c)ancel? [m/f/c]: {COLORS['end']}"
-            ).strip().lower()
-            
-            if action == 'm':
-                mount_point = get_mount_point()
-                if device["is_luks"] and device["unlocked"]:
-                    dev_path = f"/dev/mapper/{device['mapper_name']}"
-                else:
-                    dev_path = f"/dev/{device['name']}"
-                
-                try:
-                    subprocess.run(["mount", dev_path, mount_point], check=True)
-                    print(f"{COLORS['success']}Mounted {dev_path} at {mount_point}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to mount: {e}{COLORS['end']}")
-                    return False
-            
-            elif action == 'f':
-                if device["is_luks"] and device["unlocked"]:
-                    dev_path = f"/dev/mapper/{device['mapper_name']}"
-                else:
-                    dev_path = f"/dev/{device['name']}"
-                
-                try:
-                    print(f"{COLORS['info']}Running filesystem check on {dev_path}{COLORS['end']}")
-                    subprocess.run(["fsck", "-y", dev_path], check=True)
-                    print(f"{COLORS['success']}Filesystem check completed{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Filesystem check failed: {e}{COLORS['end']}")
-                    return False
-            
-            return False
-        except KeyboardInterrupt:
-            print(f"\n{COLORS['info']}Operation cancelled{COLORS['end']}")
-            sys.exit(0)
-
-def handle_luks_device(device):
-    """Handle LUKS encrypted devices"""
+def get_key() -> str:
+    """Single-key read; fallback to line read if no TTY."""
+    if not sys.stdin.isatty():
+        line = safe_input("")
+        if not line:
+            return ""
+        ch = line[0]
+        if ch == "k": return "up"
+        if ch == "j": return "down"
+        if ch == "\r" or ch == "\n": return "enter"
+        return ch
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
     try:
-        if device["unlocked"]:
-            action = input(
-                f"{COLORS['prompt']}LUKS device is unlocked. "
-                f"(m)ount, (u)nmount, (l)ock, (r)emount, or (c)hange passphrase? [m/u/l/r/c]: {COLORS['end']}"
-            ).strip().lower()
-            
-            if action == 'm':
-                mount_point = get_mount_point()
-                dev_path = f"/dev/mapper/{device['mapper_name']}"
-                try:
-                    subprocess.run(["mount", dev_path, mount_point], check=True)
-                    print(f"{COLORS['success']}Mounted {dev_path} at {mount_point}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to mount: {e}{COLORS['end']}")
-                    return False
-            
-            elif action == 'u':
-                dev_path = f"/dev/mapper/{device['mapper_name']}"
-                try:
-                    subprocess.run(["umount", dev_path], check=True)
-                    print(f"{COLORS['success']}Unmounted {dev_path}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to unmount: {e}{COLORS['end']}")
-                    if kill_processes_using_device(device):
-                        try:
-                            subprocess.run(["umount", dev_path], check=True)
-                            print(f"{COLORS['success']}Unmounted after killing processes{COLORS['end']}")
-                            return True
-                        except subprocess.CalledProcessError as e:
-                            print(f"{COLORS['error']}Still can't unmount: {e}{COLORS['end']}")
-                            return False
-                    return False
-            
-            elif action == 'l':
-                try:
-                    subprocess.run(["cryptsetup", "close", device["mapper_name"]], check=True)
-                    print(f"{COLORS['success']}Locked LUKS device /dev/mapper/{device['mapper_name']}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to lock: {e}{COLORS['end']}")
-                    return False
-            
-            elif action == 'r':
-                mount_point = device["mountpoint"] if device["mountpoint"] else get_mount_point()
-                dev_path = f"/dev/mapper/{device['mapper_name']}"
-                try:
-                    subprocess.run(["umount", dev_path], check=True)
-                    subprocess.run(["mount", dev_path, mount_point], check=True)
-                    print(f"{COLORS['success']}Remounted {dev_path} at {mount_point}{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to remount: {e}{COLORS['end']}")
-                    return False
-            
-            elif action == 'c':
-                dev_path = f"/dev/{device['name']}"
-                try:
-                    subprocess.run(["cryptsetup", "luksChangeKey", dev_path], check=True)
-                    print(f"{COLORS['success']}Passphrase changed successfully{COLORS['end']}")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to change passphrase: {e}{COLORS['end']}")
-                    return False
-            
-            return False
-        else:
-            action = input(
-                f"{COLORS['prompt']}LUKS encrypted device. "
-                f"(u)nlock, (v)iew info, or (c)ancel? [u/v/c]: {COLORS['end']}"
-            ).strip().lower()
-            
-            if action == 'u':
-                mapper_name = input(
-                    f"{COLORS['prompt']}Enter mapper name [{device['name']}]: {COLORS['end']}"
-                ).strip() or device["name"]
-                
-                dev_path = f"/dev/{device['name']}"
-                try:
-                    subprocess.run(["cryptsetup", "open", "--type", "luks", dev_path, mapper_name], check=True)
-                    print(f"{COLORS['success']}Unlocked {dev_path} to /dev/mapper/{mapper_name}{COLORS['end']}")
-                    
-                    mount_choice = input(
-                        f"{COLORS['prompt']}Mount the unlocked device? (y/N): {COLORS['end']}"
-                    ).strip().lower()
-                    
-                    if mount_choice == 'y':
-                        mount_point = get_mount_point()
-                        try:
-                            subprocess.run(["mount", f"/dev/mapper/{mapper_name}", mount_point], check=True)
-                            print(f"{COLORS['success']}Mounted at {mount_point}{COLORS['end']}")
-                        except subprocess.CalledProcessError as e:
-                            print(f"{COLORS['error']}Failed to mount: {e}{COLORS['end']}")
-                    
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to unlock: {e}{COLORS['end']}")
-                    return False
-            
-            elif action == 'v':
-                dev_path = f"/dev/{device['name']}"
-                try:
-                    print(f"\n{COLORS['info']}LUKS information for {dev_path}:{COLORS['end']}")
-                    subprocess.run(["cryptsetup", "luksDump", dev_path], check=True)
-                    return False
-                except subprocess.CalledProcessError as e:
-                    print(f"{COLORS['error']}Failed to get LUKS info: {e}{COLORS['end']}")
-                    return False
-            
-            return False
-    except KeyboardInterrupt:
-        print(f"\n{COLORS['info']}Operation cancelled{COLORS['end']}")
-        sys.exit(0)
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":  # escape seq
+            seq1 = sys.stdin.read(1)
+            if seq1 == "[":
+                seq2 = sys.stdin.read(1)
+                return {"A":"up","B":"down","C":"right","D":"left"}.get(seq2, "esc")
+            return "esc"
+        if ch.lower() == "h": return "left"
+        if ch.lower() == "j": return "down"
+        if ch.lower() == "k": return "up"
+        if ch.lower() == "l": return "right"
+        if ch == "\r": return "enter"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
-def get_mount_point(default=""):
-    """Get mount point with tab completion"""
-    # Populate completion list with common mount points
-    global completion_list
-    completion_list = [
-        "/mnt", "/media", "/mount", "/data",
-        "/home", "/var", "/tmp", "/usr"
-    ]
-    
-    # Add existing mount points from /etc/fstab
+def df_usage(mountpoint: str) -> str:
+    if not mountpoint or mountpoint == "-":
+        return "-"
     try:
-        with open("/etc/fstab", "r") as f:
-            for line in f:
-                if line.strip() and not line.startswith("#"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        completion_list.append(parts[1])
+        out = run_cmd(["df", "-h", mountpoint], capture=True).stdout.strip().splitlines()
+        if len(out) >= 2:
+            parts = out[1].split()
+            return parts[4] if len(parts) >= 5 else "ERR"
     except Exception:
-        pass
-    
-    # Add existing directories under /mnt and /media
-    for base in ["/mnt", "/media"]:
+        return "ERR"
+    return "ERR"
+
+def color_usage(usage: str) -> str:
+    if usage.endswith("%"):
         try:
-            for entry in os.listdir(base):
-                path = os.path.join(base, entry)
-                if os.path.isdir(path):
-                    completion_list.append(path)
+            v = int(usage.rstrip("%"))
+            if v < 70: return f"{COL['green']}{usage}{COL['reset']}"
+            if v < 90: return f"{COL['yellow']}{usage}{COL['reset']}"
+            return f"{COL['red']}{usage}{COL['reset']}"
         except Exception:
             pass
-    
-    completion_list = sorted(list(set(completion_list)))
-    
-    # Prompt for mount point
-    prompt = f"Enter mount point [{default}]: " if default else "Enter mount point (Tab to complete): "
-    while True:
-        try:
-            mount_point = input(COLORS["prompt"] + prompt + COLORS["end"]).strip()
-            if not mount_point and default:
-                mount_point = default
-                break
-            if mount_point:
-                break
-            print(f"{COLORS['error']}No mount point entered{COLORS['end']}")
-        except KeyboardInterrupt:
-            print(f"\n{COLORS['info']}Operation cancelled{COLORS['end']}")
-            sys.exit(0)
-    
-    # Create directory if needed
-    if not os.path.exists(mount_point):
-        print(f"{COLORS['info']}Creating mount point {mount_point}{COLORS['end']}")
-        try:
-            os.makedirs(mount_point, exist_ok=True)
-        except Exception as e:
-            print(f"{COLORS['error']}Failed to create directory: {e}{COLORS['end']}")
-            sys.exit(1)
-    
-    return mount_point
+    if usage == "ERR":
+        return f"{COL['red']}ERR{COL['reset']}"
+    return usage
 
-def handle_device_actions(device):
-    """Route to appropriate handler based on device type"""
-    if device["is_swap"]:
-        if device["mountpoint"]:  # Swap is active
-            action = input(
-                f"{COLORS['prompt']}Swap is active. (o)ff, (c)ancel? [o/c]: {COLORS['end']}"
-            ).strip().lower()
-            if action == 'o':
-                return handle_swap(device, "off")
-        else:
-            action = input(
-                f"{COLORS['prompt']}Swap is inactive. (o)n, (c)ancel? [o/c]: {COLORS['end']}"
-            ).strip().lower()
-            if action == 'o':
-                return handle_swap(device, "on")
-        return False
-    elif device["is_luks"]:
-        return handle_luks_device(device)
-    else:
-        return handle_normal_device(device)
+def parent_disk(name: str) -> str:
+    # nvme0n1p3 -> nvme0n1 ; mmcblk0p1 -> mmcblk0 ; sda3 -> sda
+    if re.match(r"^(nvme\d+n\d+p)\d+$", name):
+        return re.sub(r"p\d+$", "", name)
+    if re.match(r"^mmcblk\d+p\d+$", name):
+        return re.sub(r"p\d+$", "", name)
+    return re.sub(r"\d+$", "", name)
 
-def main():
-    print_banner()
-    require_root()
-    init_tab_completion()
+# --------------------
+# Data
+# --------------------
+@dataclass
+class Partition:
+    name: str
+    size: str
+    fstype: str
+    mountpoints: List[str] = field(default_factory=list)
+    label: Optional[str] = None
+    uuid: Optional[str] = None
+    type: Optional[str] = None
+    is_swap: bool = False
+    is_luks: bool = False
+    luks_mapper: Optional[str] = None
+    luks_unlocked: bool = False
 
+    @property
+    def dev(self) -> str:
+        return f"/dev/{self.name}"
+
+    @property
+    def mount(self) -> str:
+        mps = [m for m in (self.mountpoints or []) if m]
+        return mps[0] if mps else "-"
+
+# --------------------
+# lsblk parsing
+# --------------------
+def fetch_devices() -> List[Partition]:
     try:
-        devices = get_block_devices()
-        if not devices:
-            print(f"{COLORS['error']}No partitions found{COLORS['end']}")
-            sys.exit(1)
+        out = run_cmd(["lsblk", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS"], capture=True).stdout
+    except Exception:
+        logging.exception("lsblk failed")
+        return []
+    try:
+        raw = json.loads(out).get("blockdevices", [])
+    except Exception:
+        logging.exception("lsblk JSON parse failed")
+        return []
+    parts: List[Partition] = []
 
-        list_devices(devices)
-        device = get_device_choice(devices)
-        
-        if not handle_device_actions(device):
-            print(f"{COLORS['info']}No action taken{COLORS['end']}")
-            sys.exit(0)
-            
-    except KeyboardInterrupt:
-        print(f"\n{COLORS['info']}Operation cancelled{COLORS['end']}")
-        sys.exit(0)
+    def walk(node: Dict[str, Any]):
+        name = node.get("name", "")
+        size = node.get("size", "")
+        typ = node.get("type", "")
+        fs = node.get("fstype") or ""
+        label = node.get("label")
+        uuid = node.get("uuid")
+        mps = node.get("mountpoints") or []
+
+        is_swap = (fs == "swap")
+        is_luks = False
+        mapper = None
+        unlocked = False
+
+        if typ == "crypt":
+            is_luks = True
+            mapper = name
+            unlocked = True
+        elif fs == "crypto_LUKS":
+            is_luks = True
+            unlocked = False
+
+        if typ in ("part", "crypt", "lvm") or (typ and typ != "disk"):
+            p = Partition(name=name, size=size, fstype=fs, mountpoints=mps,
+                          label=label, uuid=uuid, type=typ, is_swap=is_swap,
+                          is_luks=is_luks, luks_mapper=mapper, luks_unlocked=unlocked)
+            parts.append(p)
+        for ch in (node.get("children") or []):
+            walk(ch)
+
+    for dev in raw:
+        walk(dev)
+
+    # link parents to child mappers heuristically
+    for p in parts:
+        if p.is_luks and not p.luks_unlocked:
+            for cand in parts:
+                if cand.type == "crypt" and cand.luks_unlocked:
+                    if cand.name.startswith(p.name) or (p.uuid and p.uuid in cand.name):
+                        p.luks_unlocked = True
+                        p.luks_mapper = cand.name
+                        break
+    return parts
+
+# --------------------
+# UI helpers
+# --------------------
+def pad(s: str, w: int) -> str:
+    return (s or "").ljust(w)[:w]
+
+def shorten(s: str, w: int) -> str:
+    if not s:
+        return ""
+    if len(s) <= w:
+        return s
+    return s[: max(0, w - 1)] + "…"
+
+def format_row(p: Partition, sel=False, mount_w=22) -> str:
+    usage = color_usage(df_usage(p.mount))
+    fs = p.fstype or "-"
+    label = p.label or p.uuid or "-"
+    status = []
+    if p.is_swap:
+        status.append("SWAP")
+    if p.is_luks and p.luks_unlocked:
+        status.append(f"LUKS:UNLOCKED({p.luks_mapper or '-'})")
+    elif p.is_luks:
+        status.append("LUKS:LOCKED")
+    cols = [
+        pad(p.name, 14),
+        pad(p.size, 8),
+        pad(fs, 10),
+        pad(shorten(label, 20), 20),
+        pad(shorten(p.mount, mount_w), mount_w),
+        pad(shorten("/".join(status) if status else "-", 28), 28),
+        pad(usage, 6),
+    ]
+    line = " ".join(cols)
+    return (COL["rev"] + line + COL["reset"]) if sel else line
+
+def draw_list(devs: List[Partition], selected: int):
+    clear_screen()
+    if sys.stdout.isatty():
+        print(COL["magenta"] + BANNER + COL["reset"])
+    title = "Storage Browser  •  q=quit  r=reload  arrows/hjkl=move  Enter=details  x=open  t=terminal"
+    if SAFE_MODE:
+        title += "  " + COL["yellow"] + "[SAFE MODE]" + COL["reset"]
+    if NO_GUI:
+        title += "  " + COL["yellow"] + "[NO-GUI]" + COL["reset"]
+    print(COL["bold"] + title + COL["reset"])
+    max_mount = max([len(p.mount) for p in devs] + [5])
+    mount_w = min(max_mount + 2, 30)
+    header = " ".join([
+        pad("Device",14), pad("Size",8), pad("FSType",10),
+        pad("Label/UUID",20), pad("Mount",mount_w),
+        pad("Status",28), pad("Use%",6)
+    ])
+    print(COL["underline"] + header + COL["reset"])
+    for i, p in enumerate(devs):
+        print(format_row(p, i == selected, mount_w))
+
+# --------------------
+# Safety decorator
+# --------------------
+def block_if_safe(func: Callable) -> Callable:
+    def wrapper(*a, **kw):
+        if SAFE_MODE:
+            print(f"{COL['yellow']}[SAFE MODE] {func.__name__} blocked{COL['reset']}")
+            logging.info("SAFE_MODE blocked %s", func.__name__)
+            return None
+        return func(*a, **kw)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+# --------------------
+# GUI and terminal launching (works on Wayland/X11/hybrid)
+# --------------------
+def has_display() -> bool:
+    if NO_GUI:
+        return False
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+def run_as_original_user(cmd: List[str]):
+    """
+    When the script is running under sudo, call command as original user preserving
+    relevant env variables (DISPLAY, XAUTHORITY, WAYLAND_DISPLAY).
+    If not under sudo, just run subprocess.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    env = os.environ.copy()
+    # minimal env pass-through for display
+    for k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    if sudo_user:
+        su_cmd = ["sudo", "-u", sudo_user, "env"]
+        # pass through the display environment entries explicitly
+        for k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
+            if k in env and env[k]:
+                su_cmd.append(f"{k}={env[k]}")
+        su_cmd.extend(cmd)
+        try:
+            subprocess.Popen(su_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            logging.exception("run_as_original_user failed with sudo -u")
+            return False
+    else:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            return True
+        except Exception:
+            logging.exception("run_as_original_user failed")
+            return False
+
+def open_file_manager(path: str):
+    if not path or path == "-":
+        print(f"{COL['red']}[!] Not mounted.{COL['reset']}")
+        return
+    if not has_display():
+        # headless fallback: try terminal file manager
+        for cmd in ("ranger", "mc", "nnn"):
+            if shutil.which(cmd):
+                try:
+                    os.execvp(cmd, [cmd, path])
+                except Exception:
+                    continue
+        print(f"{COL['yellow']}No GUI and no terminal file manager found. Path: {path}{COL['reset']}")
+        return
+    # prefer xdg-open, but run as original user if necessary
+    if shutil.which("xdg-open"):
+        if run_as_original_user(["xdg-open", path]):
+            return
+    # try popular GUIs
+    for gui in ("thunar", "nautilus", "pcmanfm", "dolphin"):
+        if shutil.which(gui):
+            if run_as_original_user([gui, path]):
+                return
+    print(f"{COL['yellow']}Could not open file manager for {path}{COL['reset']}")
+
+def open_terminal(path: str):
+    if not path or path == "-":
+        print(f"{COL['red']}[!] Not mounted.{COL['reset']}")
+        return
+    if has_display():
+        # prefer terminals known to accept working dir
+        gui_terms = [
+            ("kitty", ["kitty", "--directory", path]),
+            ("wezterm", ["wezterm", "start", "--cwd", path]),
+            ("gnome-terminal", ["gnome-terminal", "--", os.environ.get("SHELL", "/bin/sh"), "-c", f"cd '{path}' && exec {os.environ.get('SHELL','/bin/sh')}"]),
+            ("konsole", ["konsole", "--workdir", path]),
+            ("alacritty", ["alacritty", "--working-directory", path]),
+            ("xfce4-terminal", ["xfce4-terminal", "--working-directory", path]),
+            ("foot", ["foot", "start", "--working-directory", path])  # foot variants differ per install
+        ]
+        for name, cmd in gui_terms:
+            if shutil.which(name):
+                if run_as_original_user(cmd):
+                    return
+        # fallback to xdg-open as user
+        if shutil.which("xdg-open"):
+            if run_as_original_user(["xdg-open", path]):
+                return
+        print(f"{COL['yellow']}No GUI terminal found to open at {path}{COL['reset']}")
+    else:
+        # headless: try terminal-based file manager or launch shell
+        for cmd in ("ranger", "mc", "nnn", "bash", "sh"):
+            if shutil.which(cmd):
+                try:
+                    os.execvp(cmd, [cmd, path] if cmd in ("ranger","mc","nnn") else [cmd])
+                except Exception:
+                    continue
+        print(f"{COL['yellow']}No terminal file manager found. Please cd to {path} manually.{COL['reset']}")
+
+# --------------------
+# Filesystem actions (privileged)
+# --------------------
+def choose_mount_point(p: Partition) -> str:
+    base = DEFAULT_MOUNT_BASE
+    name = p.label or p.name
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    default = f"{base}/{name}"
+    ans = safe_input(COL["cyan"] + f"Mount point [{default}]: " + COL["reset"])
+    if ans is None or ans.strip() == "":
+        ans = default
+    Path(ans).mkdir(parents=True, exist_ok=True)
+    return ans
+
+def kill_processes_using(p: Partition) -> bool:
+    dev_path = p.dev if not (p.is_luks and p.luks_unlocked and p.luks_mapper) else f"/dev/mapper/{p.luks_mapper}"
+    if not shutil.which("lsof"):
+        print(f"{COL['yellow']}lsof not available, cannot detect processes.{COL['reset']}")
+        return True
+    try:
+        res = run_cmd(["lsof", "-t", dev_path], capture=True)
+        pids = [x for x in res.stdout.strip().split() if x.isdigit()]
+    except Exception:
+        pids = []
+    if not pids:
+        return True
+    print(f"{COL['yellow']}Processes using {dev_path}: {', '.join(pids)}{COL['reset']}")
+    if not confirm("Kill these processes?", default_no=True):
+        return False
+    ok_all = True
+    for pid in pids:
+        try:
+            run_priv(["kill", "-TERM", pid], check=False)
+        except Exception:
+            ok_all = False
+    time.sleep(0.5)
+    return ok_all
+
+@block_if_safe
+def do_mount(p: Partition):
+    if p.mount and p.mount != "-":
+        print(f"{COL['yellow']}Already mounted at {p.mount}{COL['reset']}")
+        return
+    mp = choose_mount_point(p)
+    dev_path = p.dev
+    if p.is_luks and p.luks_unlocked and p.luks_mapper:
+        dev_path = f"/dev/mapper/{p.luks_mapper}"
+    try:
+        run_priv(["mount", dev_path, mp])
+        print(f"{ok()} Mounted {dev_path} at {mp}")
+    except Exception as e:
+        print(f"{err()} mount failed: {e}")
+
+@block_if_safe
+def do_unmount(p: Partition):
+    if not p.mount or p.mount == "-":
+        print(f"{COL['yellow']}Not mounted.{COL['reset']}")
+        return
+    if not confirm(f"Unmount {p.dev} from {p.mount}?"):
+        return
+    dev_path = p.dev if not (p.is_luks and p.luks_unlocked and p.luks_mapper) else f"/dev/mapper/{p.luks_mapper}"
+    try:
+        run_priv(["umount", dev_path])
+        print(f"{ok()} Unmounted {dev_path}")
+    except Exception:
+        print(f"{COL['yellow']}umount failed, attempting to kill processes and lazy-unmount...{COL['reset']}")
+        if kill_processes_using(p):
+            try:
+                run_priv(["umount", dev_path])
+                print(f"{ok()} Unmounted after killing processes")
+                return
+            except Exception:
+                pass
+        try:
+            run_priv(["umount", "-l", dev_path], check=False)
+            print(f"{ok()} Lazy unmount attempted for {dev_path}")
+        except Exception as e:
+            print(f"{err()} Still can't unmount: {e}")
+
+@block_if_safe
+def do_remount(p: Partition):
+    dev_path = p.dev if not (p.is_luks and p.luks_unlocked and p.luks_mapper) else f"/dev/mapper/{p.luks_mapper}"
+    mount_at = p.mount if p.mount and p.mount != "-" else choose_mount_point(p)
+    try:
+        run_priv(["umount", dev_path], check=False)
+        run_priv(["mount", dev_path, mount_at])
+        print(f"{ok()} Remounted {dev_path} at {mount_at}")
+    except Exception as e:
+        print(f"{err()} remount failed: {e}")
+
+@block_if_safe
+def do_fsck(p: Partition):
+    dev_path = p.dev if not (p.is_luks and p.luks_unlocked and p.luks_mapper) else f"/dev/mapper/{p.luks_mapper}"
+    if p.mount and p.mount != "-":
+        if not confirm(f"{dev_path} is mounted at {p.mount}. Unmount to run fsck?"):
+            return
+        try:
+            run_priv(["umount", dev_path])
+        except Exception:
+            if not kill_processes_using(p):
+                print(f"{err()} aborting fsck")
+                return
+            run_priv(["umount", dev_path], check=False)
+    try:
+        print(COL["cyan"] + f"Running fsck on {dev_path} ..." + COL["reset"])
+        run_priv(["fsck", "-y", dev_path])
+        print(ok(), "Filesystem check completed")
+    except Exception as e:
+        print(f"{err()} fsck failed: {e}")
+
+@block_if_safe
+def do_eject(p: Partition):
+    base = parent_disk(p.name)
+    whole = f"/dev/{base}"
+    if not confirm(f"Power off (eject) whole device {whole}?"):
+        return
+    if p.mount and p.mount != "-":
+        if not confirm(f"{p.dev} is mounted at {p.mount}. Unmount first?", default_no=False):
+            return
+        do_unmount(p)
+    try:
+        run_priv(["udisksctl", "power-off", "-b", whole])
+        print(f"{ok()} Ejected {whole}")
+    except Exception as e:
+        print(f"{err()} eject failed: {e}")
+
+@block_if_safe
+def do_swap_toggle(p: Partition):
+    if not p.is_swap:
+        print(f"{COL['yellow']}Not a swap device.{COL['reset']}")
+        return
+    dev_path = p.dev
+    try:
+        out = run_cmd(["swapon", "--show=NAME"], capture=True).stdout
+    except Exception:
+        out = ""
+    active = any(dev_path in line for line in out.splitlines())
+    if active:
+        if not confirm(f"Disable swap on {dev_path}?"):
+            return
+        try:
+            run_priv(["swapoff", dev_path])
+            print(f"{ok()} swapoff {dev_path}")
+        except Exception as e:
+            print(f"{COL['yellow']}swapoff failed: {e}{COL['reset']}")
+    else:
+        if not confirm(f"Enable swap on {dev_path}?", default_no=False):
+            return
+        try:
+            run_priv(["swapon", dev_path])
+            print(f"{ok()} swapon {dev_path}")
+        except Exception as e:
+            print(f"{err()} swapon failed: {e}")
+
+@block_if_safe
+def luks_unlock_passphrase(p: Partition):
+    if not p.is_luks or p.luks_unlocked:
+        print(f"{COL['yellow']}Not a locked LUKS partition.{COL['reset']}")
+        return
+    mapper = safe_input(COL['cyan'] + f"Mapper name [{p.name}]: " + COL['reset']) or p.name
+    try:
+        run_priv(["cryptsetup", "open", "--type", "luks", p.dev, mapper])
+        print(f"{ok()} Unlocked {p.dev} → /dev/mapper/{mapper}")
+    except Exception as e:
+        print(f"{err()} cryptsetup open failed: {e}")
+
+@block_if_safe
+def luks_unlock_keyfile(p: Partition):
+    if not p.is_luks or p.luks_unlocked:
+        print(f"{COL['yellow']}Not a locked LUKS partition.{COL['reset']}")
+        return
+    candidates = []
+    if p.uuid: candidates.append(VMKEYS_DIR / f"{p.uuid}.key")
+    if p.label: candidates.append(VMKEYS_DIR / f"{p.label}.key")
+    candidates.append(VMKEYS_DIR / f"{p.name}.key")
+    keyfile = None
+    for c in candidates:
+        if c.is_file():
+            keyfile = str(c)
+            break
+    if not keyfile:
+        keyfile = safe_input(COL["cyan"] + f"Keyfile path (or Enter to cancel): " + COL["reset"])
+        if not keyfile:
+            print(COL["yellow"] + "Cancelled." + COL["reset"])
+            return
+        if not Path(keyfile).is_file():
+            print(COL['red'] + "Keyfile not found." + COL['reset'])
+            return
+    mapper = safe_input(COL['cyan'] + f"Mapper name [{p.name}]: " + COL['reset']) or p.name
+    try:
+        run_priv(["cryptsetup", "open", "--type", "luks", "--key-file", keyfile, p.dev, mapper])
+        print(f"{ok()} Unlocked with keyfile: /dev/mapper/{mapper}")
+    except Exception as e:
+        print(f"{err()} cryptsetup open failed: {e}")
+
+@block_if_safe
+def luks_lock(p: Partition):
+    if not p.is_luks:
+        print(f"{COL['yellow']}Not a LUKS device.{COL['reset']}")
+        return
+    mapper = p.luks_mapper or p.name
+    if p.mount and p.mount != "-":
+        if not confirm(f"{p.dev} is mounted at {p.mount}. Unmount first?"):
+            return
+        do_unmount(p)
+    try:
+        run_priv(["cryptsetup", "close", mapper])
+        print(f"{ok()} Locked /dev/mapper/{mapper}")
+    except Exception as e:
+        print(f"{err()} cryptsetup close failed: {e}")
+
+# --------------------
+# Details UI
+# --------------------
+def show_details(p: Partition):
+    while True:
+        clear_screen()
+        print(COL["bold"] + f"Details for {p.name}" + COL["reset"])
+        print(json.dumps({
+            "name": p.name, "size": p.size, "fstype": p.fstype, "mount": p.mount,
+            "label": p.label, "uuid": p.uuid, "type": p.type,
+            "is_swap": p.is_swap, "is_luks": p.is_luks,
+            "luks_mapper": p.luks_mapper, "luks_unlocked": p.luks_unlocked
+        }, indent=2))
+        print()
+        print(COL["cyan"] + "Actions: " + COL["reset"] +
+              "[m]ount  [u]nmount  [E]ject  [r]emount  [f]sck  [k]ill-pids  " +
+              "[o]unlock  [O]unlock-key  [l]ock  [s]wap  [x]open  [t]erminal  [Enter] return")
+        key = get_key()
+        if key == "enter" or key in ("esc", "q"):
+            return
+        elif key == "m": do_mount(p)
+        elif key == "u": do_unmount(p)
+        elif key == "E": do_eject(p)
+        elif key == "r": do_remount(p)
+        elif key == "f": do_fsck(p)
+        elif key == "k": kill_processes_using(p)
+        elif key == "o": luks_unlock_passphrase(p)
+        elif key == "O": luks_unlock_keyfile(p)
+        elif key == "l": luks_lock(p)
+        elif key == "s": do_swap_toggle(p)
+        elif key == "x": open_file_manager(p.mount)
+        elif key == "t": open_terminal(p.mount)
+        time.sleep(0.15)
+
+# --------------------
+# Main
+# --------------------
+def main(argv: Optional[List[str]] = None):
+    global SAFE_MODE, NO_GUI
+    parser = argparse.ArgumentParser(description="Storage browser")
+    parser.add_argument("--safe", action="store_true", help="Do not perform mutating actions")
+    parser.add_argument("--no-gui", action="store_true", help="Force terminal-only behavior (no GUI launches)")
+    parser.add_argument("--mount-base", type=str, help="Mount base directory (overrides MOUNT_BASE env)")
+    args = parser.parse_args(argv or sys.argv[1:])
+    SAFE_MODE = SAFE_MODE or args.safe
+    NO_GUI = args.no_gui or bool(os.environ.get("MOUNT_TOOL_NO_GUI"))
+    if args.mount_base:
+        os.environ["MOUNT_BASE"] = args.mount_base
+
+    selected = 0
+    devs: List[Partition] = fetch_devices()
+    def on_resize(signum, frame):
+        draw_list(devs, selected)
+    signal.signal(signal.SIGWINCH, on_resize)
+
+    if not devs:
+        print(COL['red'] + "No partitions found." + COL['reset'])
+        return
+
+    while True:
+        draw_list(devs, selected)
+        k = get_key()
+        if k in ("q", "esc"):
+            break
+        elif k in ("r",):
+            devs = fetch_devices()
+            if selected >= len(devs):
+                selected = 0
+        elif k == "up":
+            selected = (selected - 1) % len(devs)
+        elif k == "down":
+            selected = (selected + 1) % len(devs)
+        elif k == "x":
+            open_file_manager(devs[selected].mount)
+            safe_input("\nPress Enter to continue...")
+        elif k == "t":
+            open_terminal(devs[selected].mount)
+            safe_input("\nPress Enter to continue...")
+        elif k == "enter":
+            devs = fetch_devices()
+            if selected >= len(devs):
+                selected = 0
+            show_details(devs[selected])
 
 if __name__ == "__main__":
-    main()
-
-
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
+        sys.exit(0)
